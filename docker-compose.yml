@@ -1,0 +1,261 @@
+x-kafka-base: &kafka-base
+    image: apache/kafka:4.0.1
+    restart: always
+    networks:
+        - internet
+    healthcheck:
+        test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+        start_period: 10s
+
+x-api_to_orchestrator-base: &kafka_api_to_orchestrator
+    CLUSTER_ID: o2Zuz7LCQGyyQg5tADn1fw
+    KAFKA_NUM_PARTITIONS: 9
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka_api_to_orchestrator1:9093,2@kafka_api_to_orchestrator2:9093,3@kafka_api_to_orchestrator3:9093
+
+x-orchestrator_and_runner-base: &kafka_orchestrator_and_runner
+    CLUSTER_ID: sFO6y5ElQc-4-Gmqr1dvbg
+    KAFKA_NUM_PARTITIONS: 9
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka_orchestrator_and_runner1:9093,2@kafka_orchestrator_and_runner2:9093,3@kafka_orchestrator_and_runner3:9093
+
+x-runner_to_inference-base: &kafka_runner_to_inference
+    CLUSTER_ID: mYdVNF5EQEKSHWULoyhQxA
+    KAFKA_NUM_PARTITIONS: 1
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka_runner_to_inference1:9093
+
+x-inference_to_orchestrator-base: &kafka_inference_to_orchestrator
+    CLUSTER_ID: uOoH8QmDRoyujZgSUESBuA
+    KAFKA_NUM_PARTITIONS: 1
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka_inference_to_orchestrator1:9093
+
+x-kafka-env: &kafka-env
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    KAFKA_PROCESS_ROLES: broker,controller
+    KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+services:
+    kafka_api_to_orchestrator1:
+        <<: *kafka-base
+
+        environment:
+            <<: 
+                - *kafka-env
+                - *kafka_api_to_orchestrator
+            KAFKA_NODE_ID: 1
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_api_to_orchestrator1:9092,EXTERNAL://localhost:19091
+            
+        ports:
+            - 19091:29092
+
+    kafka_api_to_orchestrator2:
+        <<: *kafka-base
+
+        environment:
+            <<: 
+                - *kafka-env
+                - *kafka_api_to_orchestrator
+            KAFKA_NODE_ID: 2
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_api_to_orchestrator2:9092,EXTERNAL://localhost:19092
+
+        ports:
+            - 19092:29092
+
+    kafka_api_to_orchestrator3:
+        <<: *kafka-base
+
+        environment:
+            <<: 
+                - *kafka-env
+                - *kafka_api_to_orchestrator
+            KAFKA_NODE_ID: 3
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_api_to_orchestrator3:9092,EXTERNAL://localhost:19093
+            
+        ports:
+            - 19093:29092
+
+    kafka_orchestrator_and_runner1:
+        <<: *kafka-base
+
+        environment:
+            <<: 
+                - *kafka-env
+                - *kafka_orchestrator_and_runner
+            KAFKA_NODE_ID: 1
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_orchestrator_and_runner1:9092,EXTERNAL://localhost:29091
+            
+        ports:
+            - 29091:29092
+
+    kafka_orchestrator_and_runner2:
+        <<: *kafka-base
+
+        environment:
+            <<: 
+                - *kafka-env
+                - *kafka_orchestrator_and_runner
+            KAFKA_NODE_ID: 2
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_orchestrator_and_runner2:9092,EXTERNAL://localhost:29092
+            
+        ports:
+            - 29092:29092
+
+    kafka_orchestrator_and_runner3:
+        <<: *kafka-base
+
+        environment:
+            <<: 
+                - *kafka-env
+                - *kafka_orchestrator_and_runner
+            KAFKA_NODE_ID: 3
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_orchestrator_and_runner3:9092,EXTERNAL://localhost:29093
+            
+        ports:
+            - 29093:29092
+
+    kafka_runner_to_inference1:
+        <<: *kafka-base
+
+        environment:
+            <<: 
+                - *kafka-env
+                - *kafka_runner_to_inference
+            KAFKA_NODE_ID: 1
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_runner_to_inference1:9092,EXTERNAL://localhost:39091
+            
+        ports:
+            - 39091:29092
+
+    kafka_inference_to_orchestrator1:
+        <<: *kafka-base
+
+        environment:
+            <<: 
+                - *kafka-env
+                - *kafka_inference_to_orchestrator
+            KAFKA_NODE_ID: 1
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_inference_to_orchestrator1:9092,EXTERNAL://localhost:49091
+            
+        ports:
+            - 49091:29092
+
+    postgres:
+        image: postgres:14.19-alpine3.21
+        container_name: postgres
+        restart: always
+        healthcheck:
+            test: ["CMD-SHELL", "nc -z localhost 5432 || exit 1"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+            start_period: 10s
+        environment:
+            - POSTGRES_PASSWORD=myveryveryveryveryverysecretpassword1234
+        ports:
+            - 55432:5432
+        networks:
+            - internet
+        volumes:
+            - pgdata:/var/lib/postgresql/data/
+            - ./initdb:/docker-entrypoint-initdb.d
+
+    api:
+        image: api:v01
+        container_name: api
+        restart: always
+        networks:
+            - internet
+        depends_on:
+            kafka_api_to_orchestrator1:
+                condition: service_healthy
+            kafka_api_to_orchestrator2:
+                condition: service_healthy
+            kafka_api_to_orchestrator3:
+                condition: service_healthy
+    
+    orchestrator:
+        image: orchestrator:v01
+        container_name: orchestrator  
+        restart: always  
+        networks:
+            - internet
+        depends_on:
+            kafka_api_to_orchestrator1:
+                condition: service_healthy
+            kafka_api_to_orchestrator2:
+                condition: service_healthy
+            kafka_api_to_orchestrator3:
+                condition: service_healthy
+            kafka_orchestrator_and_runner1:
+                condition: service_healthy
+            kafka_orchestrator_and_runner2:
+                condition: service_healthy
+            kafka_orchestrator_and_runner3:
+                condition: service_healthy
+            kafka_inference_to_orchestrator1:
+                condition: service_healthy
+            postgres:
+                condition: service_healthy
+
+    runner:
+        image: runner:v01
+        restart: always
+        networks:
+            - internet
+        depends_on:
+            kafka_orchestrator_and_runner1:
+                condition: service_healthy
+            kafka_orchestrator_and_runner2:
+                condition: service_healthy
+            kafka_orchestrator_and_runner3:
+                condition: service_healthy
+            kafka_runner_to_inference1:
+                condition: service_healthy
+        volumes:
+            - ./video/:/video/
+            
+    inference:
+        image: inference:v01
+        container_name: inference   
+        restart: always 
+        networks:
+            - internet
+        depends_on:
+            kafka_inference_to_orchestrator1:
+                condition: service_healthy
+            kafka_runner_to_inference1:
+                condition: service_healthy
+
+networks:
+    internet:
+        driver: bridge
+        name: internet
+
+volumes:
+    pgdata:
