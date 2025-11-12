@@ -35,6 +35,7 @@ func ProcessScenario(path string) error {
 
 	record := &kgo.Record{
 		Topic: "path",
+		Key:   b,
 		Value: b,
 	}
 
@@ -74,6 +75,7 @@ func ChangeStatusScenario(path string, status string) error {
 
 	record := &kgo.Record{
 		Topic: "status",
+		Key:   b,
 		Value: b,
 	}
 

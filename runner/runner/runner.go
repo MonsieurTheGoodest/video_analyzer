@@ -4,17 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	vidio "github.com/AlexEidt/Vidio"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
-
-var stopped bool
-
-type videoConfig struct {
-	ID   int64  `json:"id"`
-	Path string `json:"path"`
-}
 
 type image struct {
 	Frame []byte `json:"frame"`
@@ -22,37 +16,33 @@ type image struct {
 	ID    int64  `json:"id"`
 }
 
-func Run() error {
-	for {
-		path, startFrame, err := readPath()
-
-		if err != nil {
-			return fmt.Errorf("Run ERR: %v", err)
-		}
-
-		var stopping_err error
-
-		go func() {
-			stopping_err = checkStopping(path)
-
-			fmt.Print("Run ERR: stopping ERR: ")
-		}()
-
-		err = processScenario(path, startFrame)
-
-		if err != nil {
-			return fmt.Errorf("Run ERR: %v", err)
-		}
-
-		if stopping_err != nil {
-			stopped = true
-
-			return fmt.Errorf("Run ERR: stopping ERR: %v", stopping_err)
-		}
-	}
+type Processor struct {
+	StartFrame int64  `json:"id"`
+	Path       string `json:"path"`
+	Epoch      int64  `json:"epoch"`
+	stopped    bool
 }
 
-func checkStopping(path string) error {
+type stopping struct {
+	StopPath string `json:"stop_path"`
+	Key      string `json:"key"`
+	Epoch    int64  `json:"epoch"`
+	tm       time.Time
+}
+
+func (s *stopping) isEqual(s1 *stopping) bool {
+	return s.StopPath == s1.StopPath && s.Key == s1.Key && s.Epoch == s1.Epoch
+}
+
+func NewProcessor() *Processor {
+	return &Processor{}
+}
+
+const skipTime = time.Second * 5
+const heartbeatInterval = time.Second * 3
+const sessionTimeout = time.Second * 15
+
+func (p *Processor) CheckStopping() error {
 	seeds := []string{
 		"kafka_orchestrator_and_runner1:9092",
 		"kafka_orchestrator_and_runner2:9092",
@@ -72,43 +62,61 @@ func checkStopping(path string) error {
 	}
 	defer cl.Close()
 
-	for {
-		kafka_ctx := context.Background()
+	lastStopping := stopping{}
 
-		fetches := cl.PollFetches(kafka_ctx)
+	for {
+		fetches := cl.PollFetches(context.Background())
 
 		if errs := fetches.Errors(); len(errs) > 0 {
 			return fmt.Errorf("checkStopping ERR: fetching message ERR: %v", errs)
 		}
 
 		iter := fetches.RecordIter()
-		record := iter.Next()
 
-		var stoppedID string
+		for {
+			record := iter.Next()
 
-		err = json.Unmarshal(record.Value, &stoppedID)
-
-		if err != nil {
-			return fmt.Errorf("checkStopping ERR: Unmarshaling ERR: %v", err)
-		}
-
-		if stoppedID == path {
-			stopped = true
-
-			err = cl.CommitUncommittedOffsets(context.Background())
-
-			if err != nil {
-				return fmt.Errorf("checkStopping ERR: commiting offsetts ERR: %v", err)
+			if record == nil || len(record.Value) == 0 {
+				return fmt.Errorf("checkStopping ERR: refusing to send empty value")
 			}
 
-			break
+			var stp stopping
+
+			err = json.Unmarshal(record.Value, &stp)
+
+			if err != nil {
+				return fmt.Errorf("checkStopping ERR: Unmarshaling ERR: %v", err)
+			}
+
+			if stp.StopPath == p.Path && stp.Epoch >= p.Epoch {
+				p.stopped = true
+
+				err = cl.CommitUncommittedOffsets(context.Background())
+
+				if err != nil {
+					return fmt.Errorf("checkStopping ERR: commiting offsetts ERR: %v", err)
+				}
+
+				break
+			}
+
+			if !stp.isEqual(&lastStopping) {
+				lastStopping = stp
+				lastStopping.tm = time.Now()
+			} else if lastStopping.tm.Add(skipTime).Before(time.Now()) && p.Path != "" {
+				err = cl.CommitUncommittedOffsets(context.Background())
+
+				if err != nil {
+					return fmt.Errorf("checkStopping ERR: commiting offsetts ERR: %v", err)
+				}
+
+				break
+			}
 		}
 	}
-
-	return nil
 }
 
-func readPath() (string, int64, error) {
+func (p *Processor) ReadPath() error {
 	seeds := []string{
 		"kafka_orchestrator_and_runner1:9092",
 		"kafka_orchestrator_and_runner2:9092",
@@ -120,40 +128,63 @@ func readPath() (string, int64, error) {
 		kgo.ConsumerGroup("runner"),
 		kgo.AllowAutoTopicCreation(),
 		kgo.ConsumeTopics("path"),
-
-		//todo
-		//kgo.HeartbeatInterval(time.Second*3),
-		//kgo.SessionTimeout(time.Second*15),
+		kgo.DisableAutoCommit(),
+		kgo.HeartbeatInterval(heartbeatInterval),
+		kgo.SessionTimeout(sessionTimeout),
 	)
 
 	if err != nil {
-		return "", -1, fmt.Errorf("readPath ERR: client creating ERR: %v", err)
+		return fmt.Errorf("readPath ERR: client creating ERR: %v", err)
 	}
 	defer cl.Close()
 
 	ctx := context.Background()
 
-	fetches := cl.PollFetches(ctx)
+	for {
+		fetches := cl.PollFetches(ctx)
 
-	if errs := fetches.Errors(); len(errs) > 0 {
-		return "", -1, fmt.Errorf("readPath ERR: fetching message ERR: %v", errs)
+		if errs := fetches.Errors(); len(errs) > 0 {
+			return fmt.Errorf("readPath ERR: fetching message ERR: %v", errs)
+		}
+
+		iter := fetches.RecordIter()
+
+		for !iter.Done() {
+			record := iter.Next()
+
+			if record == nil || len(record.Value) == 0 {
+				continue
+			}
+
+			cl.CommitUncommittedOffsets(context.Background())
+
+			var config Processor
+
+			err = json.Unmarshal(record.Value, &config)
+
+			if err != nil {
+				return fmt.Errorf("readPath ERR: record Unmarshaling ERR: %v", err)
+			}
+
+			err = p.commitStartOfScenario()
+
+			if err != nil {
+				return fmt.Errorf("readPath ERR: %v", err)
+			}
+
+			p.Path = config.Path
+			p.stopped = false
+
+			err = p.processScenario()
+
+			if err != nil {
+				return fmt.Errorf("readPath ERR: %v", err)
+			}
+		}
 	}
-
-	iter := fetches.RecordIter()
-	record := iter.Next()
-
-	var config videoConfig
-
-	err = json.Unmarshal(record.Value, &config)
-
-	if err != nil {
-		return "", -1, fmt.Errorf("readPath ERR: record Unmarshaling ERR: %v", err)
-	}
-
-	return config.Path, config.ID, nil
 }
 
-func commitEndOfScenario(path string) error {
+func (p *Processor) commitEndOfScenario() error {
 	seeds := []string{
 		"kafka_orchestrator_and_runner1:9092",
 		"kafka_orchestrator_and_runner2:9092",
@@ -172,7 +203,7 @@ func commitEndOfScenario(path string) error {
 
 	ctx := context.Background()
 
-	b, err := json.Marshal(path)
+	b, err := json.Marshal(p.Path)
 
 	if err != nil {
 		return fmt.Errorf("commitEndOfScenario ERR: marshaling ERR: %v", err)
@@ -190,8 +221,45 @@ func commitEndOfScenario(path string) error {
 	return nil
 }
 
-func processScenario(path string, startFrame int64) error {
-	video, err := vidio.NewVideo(path)
+func (p *Processor) commitStartOfScenario() error {
+	seeds := []string{
+		"kafka_orchestrator_and_runner1:9092",
+		"kafka_orchestrator_and_runner2:9092",
+		"kafka_orchestrator_and_runner3:9092",
+	}
+
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(seeds...),
+		kgo.AllowAutoTopicCreation(),
+	)
+
+	if err != nil {
+		return fmt.Errorf("commitStartOfScenario ERR: client creating ERR: %v", err)
+	}
+	defer cl.Close()
+
+	ctx := context.Background()
+
+	b, err := json.Marshal(p.Path)
+
+	if err != nil {
+		return fmt.Errorf("commitStartOfScenario ERR: marshaling ERR: %v", err)
+	}
+
+	record := &kgo.Record{
+		Topic: "start",
+		Value: b,
+	}
+
+	if err := cl.ProduceSync(ctx, record).FirstErr(); err != nil {
+		return fmt.Errorf("commitStartOfScenario ERR: producer sending message ERR: %v", err)
+	}
+
+	return nil
+}
+
+func (p *Processor) processScenario() error {
+	video, err := vidio.NewVideo(p.Path)
 
 	if err != nil {
 		return fmt.Errorf("processScenario ERR: receiving path ERR: %v", err)
@@ -205,7 +273,9 @@ func processScenario(path string, startFrame int64) error {
 		kgo.SeedBrokers(seeds...),
 		kgo.DisableIdempotentWrite(),
 		kgo.RequiredAcks(kgo.NoAck()),
-		kgo.AllowAutoTopicCreation(),
+		kgo.ProducerBatchMaxBytes(100_000_000),
+		kgo.MaxBufferedRecords(10),
+		//kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
@@ -218,11 +288,11 @@ func processScenario(path string, startFrame int64) error {
 	var id int64
 
 	for video.Read() {
-		if stopped {
+		if p.stopped {
 			break
 		}
 
-		if id < startFrame {
+		if id <= p.StartFrame {
 			id++
 
 			continue
@@ -230,7 +300,7 @@ func processScenario(path string, startFrame int64) error {
 
 		frame, err := json.Marshal(image{
 			Frame: video.FrameBuffer(),
-			Path:  path,
+			Path:  p.Path,
 			ID:    id,
 		})
 
@@ -246,10 +316,14 @@ func processScenario(path string, startFrame int64) error {
 		if err := cl.ProduceSync(ctx, record).FirstErr(); err != nil {
 			return fmt.Errorf("processScenario ERR: producer sending message ERR: %v", err)
 		}
+
+		id++
 	}
 
-	if !stopped {
-		err = commitEndOfScenario(path)
+	if !p.stopped {
+		err = p.commitEndOfScenario()
+
+		p.stopped = true
 
 		if err != nil {
 			return fmt.Errorf("processScenario ERR: %v", err)

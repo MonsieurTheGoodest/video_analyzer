@@ -2,11 +2,11 @@ package main
 
 import (
 	"api/api"
-	"errors"
+	//"errors"
 	"fmt"
 )
 
-var errStatus error = errors.New("api main ERR: status should be stop or restart")
+//var errStatus error = errors.New("api main ERR: status should be stop or restart")
 
 const MY_PATH string = "./video/1.mp4"
 
@@ -18,7 +18,7 @@ func main() {
 		return
 	}
 
-	for {
+	/*for {
 		var op string
 
 		fmt.Print("Input operation: ")
@@ -74,5 +74,5 @@ func main() {
 
 			fmt.Println(objects)
 		}
-	}
+	}*/
 }

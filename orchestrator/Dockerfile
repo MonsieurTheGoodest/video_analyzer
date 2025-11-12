@@ -13,6 +13,8 @@ COPY ./cmd/ ./cmd/
 COPY ./db/ ./db/
 COPY ./orchestrator/ ./orchestrator/
 COPY ./worker/ ./worker/
+COPY ./statuses/ ./statuses/
+COPY ./initdb/ ./initdb/
 
 RUN go mod init orchestrator
 RUN go get github.com/twmb/franz-go

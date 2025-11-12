@@ -21,15 +21,16 @@ func main() {
 	}
 	defer dataBase.Close()
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 8)
 
 	go func() { errCh <- worker.WorkMessage(dataBase) }()
 	go func() { errCh <- worker.WorkStatus(dataBase) }()
-	go func() { errCh <- worker.WorkEnd(dataBase) }()
 
 	go func() { errCh <- orchestrator.ProcessScenario(dataBase) }()
 	go func() { errCh <- orchestrator.ChangeStatus(dataBase) }()
 	go func() { errCh <- orchestrator.GetObject(dataBase) }()
+	go func() { errCh <- orchestrator.SetEnd(dataBase) }()
+	go func() { errCh <- orchestrator.SetStart(dataBase) }()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)

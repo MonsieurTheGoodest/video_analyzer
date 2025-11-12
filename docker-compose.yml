@@ -69,7 +69,7 @@ services:
                 - *kafka-env
                 - *kafka_api_to_orchestrator
             KAFKA_NODE_ID: 1
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_api_to_orchestrator1:9092,EXTERNAL://localhost:19091
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_api_to_orchestrator1:9092,EXTERNAL://host.docker.internal:19091
             
         ports:
             - 19091:29092
@@ -82,7 +82,7 @@ services:
                 - *kafka-env
                 - *kafka_api_to_orchestrator
             KAFKA_NODE_ID: 2
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_api_to_orchestrator2:9092,EXTERNAL://localhost:19092
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_api_to_orchestrator2:9092,EXTERNAL://host.docker.internal:19092
 
         ports:
             - 19092:29092
@@ -95,7 +95,7 @@ services:
                 - *kafka-env
                 - *kafka_api_to_orchestrator
             KAFKA_NODE_ID: 3
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_api_to_orchestrator3:9092,EXTERNAL://localhost:19093
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_api_to_orchestrator3:9092,EXTERNAL://host.docker.internal:19093
             
         ports:
             - 19093:29092
@@ -108,7 +108,7 @@ services:
                 - *kafka-env
                 - *kafka_orchestrator_and_runner
             KAFKA_NODE_ID: 1
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_orchestrator_and_runner1:9092,EXTERNAL://localhost:29091
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_orchestrator_and_runner1:9092,EXTERNAL://host.docker.internal:29091
             
         ports:
             - 29091:29092
@@ -121,7 +121,7 @@ services:
                 - *kafka-env
                 - *kafka_orchestrator_and_runner
             KAFKA_NODE_ID: 2
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_orchestrator_and_runner2:9092,EXTERNAL://localhost:29092
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_orchestrator_and_runner2:9092,EXTERNAL://host.docker.internal:29092
             
         ports:
             - 29092:29092
@@ -134,7 +134,7 @@ services:
                 - *kafka-env
                 - *kafka_orchestrator_and_runner
             KAFKA_NODE_ID: 3
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_orchestrator_and_runner3:9092,EXTERNAL://localhost:29093
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_orchestrator_and_runner3:9092,EXTERNAL://host.docker.internal:29093
             
         ports:
             - 29093:29092
@@ -147,7 +147,11 @@ services:
                 - *kafka-env
                 - *kafka_runner_to_inference
             KAFKA_NODE_ID: 1
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_runner_to_inference1:9092,EXTERNAL://localhost:39091
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_runner_to_inference1:9092,EXTERNAL://host.docker.internal:39091
+
+            KAFKA_MESSAGE_MAX_BYTES: 50000000
+            KAFKA_REPLICA_FETCH_MAX_BYTES: 50000000
+            KAFKA_FETCH_MESSAGE_MAX_BYTES: 50000000
             
         ports:
             - 39091:29092
@@ -160,15 +164,49 @@ services:
                 - *kafka-env
                 - *kafka_inference_to_orchestrator
             KAFKA_NODE_ID: 1
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_inference_to_orchestrator1:9092,EXTERNAL://localhost:49091
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_inference_to_orchestrator1:9092,EXTERNAL://host.docker.internal:49091
             
         ports:
             - 49091:29092
 
+    # init_orchestrator_and_runner:
+    #     image: apache/kafka:4.0.1
+    #     restart: "no"
+    #     networks: [internet]
+    #     depends_on:
+    #         kafka_orchestrator_and_runner1:
+    #             condition: service_healthy
+    #         kafka_orchestrator_and_runner2:
+    #             condition: service_healthy
+    #         kafka_orchestrator_and_runner3:
+    #             condition: service_healthy
+    #     entrypoint:
+    #         - /bin/sh
+    #         - -exc
+    #         - opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_orchestrator_and_runner1:9092 --create --if-not-exists --topic path \
+    #             --config cleanup.policy=compact,delete \
+    #             && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_orchestrator_and_runner3:9092 --list
+
+    init_runner_to_inference:
+        image: apache/kafka:4.0.1
+        restart: "no"
+        networks: [internet]
+        depends_on:
+            kafka_runner_to_inference1:
+                condition: service_healthy
+        entrypoint:
+            - /bin/sh
+            - -exc
+            - /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_runner_to_inference1:9092 --create --if-not-exists --topic frames \
+                --config max.message.bytes=10000000 \
+                && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_runner_to_inference1:9092 --list
+
+
+
     postgres:
         image: postgres:14.19-alpine3.21
         container_name: postgres
-        restart: always
+        restart: no
         healthcheck:
             test: ["CMD-SHELL", "nc -z localhost 5432 || exit 1"]
             interval: 10s
@@ -176,9 +214,9 @@ services:
             retries: 5
             start_period: 10s
         environment:
-            - POSTGRES_PASSWORD=myveryveryveryveryverysecretpassword1234
+            - POSTGRES_PASSWORD=password
         ports:
-            - 55432:5432
+            - 65432:5432
         networks:
             - internet
         volumes:
@@ -188,7 +226,7 @@ services:
     api:
         image: api:v01
         container_name: api
-        restart: always
+        restart: no
         networks:
             - internet
         depends_on:
@@ -202,7 +240,7 @@ services:
     orchestrator:
         image: orchestrator:v01
         container_name: orchestrator  
-        restart: always  
+        restart: no
         networks:
             - internet
         depends_on:
@@ -225,7 +263,7 @@ services:
 
     runner:
         image: runner:v01
-        restart: always
+        restart: no
         networks:
             - internet
         depends_on:
@@ -237,13 +275,18 @@ services:
                 condition: service_healthy
             kafka_runner_to_inference1:
                 condition: service_healthy
+            init_runner_to_inference: 
+                condition: service_started 
+        deploy:
+            mode: replicated
+            replicas: 3
         volumes:
-            - ./video/:/video/
+            - ./runner/video/:/runner/video/
             
     inference:
         image: inference:v01
         container_name: inference   
-        restart: always 
+        restart: no
         networks:
             - internet
         depends_on:
@@ -251,6 +294,8 @@ services:
                 condition: service_healthy
             kafka_runner_to_inference1:
                 condition: service_healthy
+            init_runner_to_inference: 
+                condition: service_started 
 
 networks:
     internet:

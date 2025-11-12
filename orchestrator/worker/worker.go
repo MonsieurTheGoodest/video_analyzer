@@ -11,69 +11,23 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-func WorkEnd(db *db.DataBase) error {
-	seeds := []string{
-		"kafka_orchestrator_and_runner1:9092",
-		"kafka_orchestrator_and_runner2:9092",
-		"kafka_orchestrator_and_runner3:9092",
-	}
-
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(seeds...),
-		kgo.ConsumerGroup("workEnd"),
-		kgo.ConsumeTopics("end"),
-		kgo.DisableAutoCommit(),
-		kgo.AllowAutoTopicCreation(),
-	)
-
-	if err != nil {
-		return fmt.Errorf("workEnd ERR: client creating ERR: %v", err)
-	}
-	defer cl.Close()
-
-	for {
-		ctx := context.Background()
-
-		fetches := cl.PollFetches(ctx)
-
-		if errs := fetches.Errors(); len(errs) > 0 {
-			return fmt.Errorf("workEnd ERR: fetching message ERR: %v", errs)
-		}
-
-		iter := fetches.RecordIter()
-		record := iter.Next()
-
-		if len(record.Value) == 0 {
-			continue
-		}
-
-		var path string
-
-		err = json.Unmarshal(record.Value, &path)
-
-		if err != nil {
-			return fmt.Errorf("workEnd ERR: record Unmarshaling ERR: %v", err)
-		}
-
-		err = db.SetEndOfScenario(context.Background(), path)
-
-		if err != nil {
-			return fmt.Errorf("workEnd ERR: setting end ERR: %v", err)
-		}
-
-		err = cl.CommitUncommittedOffsets(context.Background())
-
-		if err != nil {
-			return fmt.Errorf("workEnd ERR: offset commiting ERR: %v", err)
-		}
-	}
-}
+// --- STRUCTS ---
 
 type VideoMsg struct {
-	ID         int64
-	Path       string
-	StartFrame int64
+	ID         int64  `json:"id"`
+	Path       string `json:"path"`
+	StartFrame int64  `json:"start_frame"`
+	Epoch      int64  `json:"epoch"`
 }
+
+type StopMsg struct {
+	ID    int64  `json:"id"`
+	Path  string `json:"path"`
+	Key   string `json:"key"`
+	Epoch int64  `json:"epoch"`
+}
+
+// --- WORKER STATUS (video_messages) ---
 
 type WorkerStatus struct {
 	Pool      *pgxpool.Pool
@@ -108,7 +62,7 @@ func (w *WorkerStatus) Run(ctx context.Context) error {
             DELETE FROM video_messages m
             USING cte
             WHERE m.id = cte.id
-            RETURNING m.id, m.path, m.start_frame
+            RETURNING m.id, m.path, m.start_frame, m.epoch
         `, w.BatchSize)
 		if err != nil {
 			return fmt.Errorf("pop video_messages: %w", err)
@@ -117,7 +71,7 @@ func (w *WorkerStatus) Run(ctx context.Context) error {
 		var batch []VideoMsg
 		for rows.Next() {
 			var m VideoMsg
-			if err := rows.Scan(&m.ID, &m.Path, &m.StartFrame); err != nil {
+			if err := rows.Scan(&m.ID, &m.Path, &m.StartFrame, &m.Epoch); err != nil {
 				rows.Close()
 				return fmt.Errorf("scan: %w", err)
 			}
@@ -157,8 +111,6 @@ func WorkMessage(dbase *db.DataBase) error {
 		BatchSize: 100,
 		Handle: func(ctx context.Context, msgs []VideoMsg) error {
 			for _, m := range msgs {
-				ctx := context.Background()
-
 				message, err := json.Marshal(m)
 				if err != nil {
 					return fmt.Errorf("workMessage ERR: record Marshaling ERR: %v", err)
@@ -166,6 +118,7 @@ func WorkMessage(dbase *db.DataBase) error {
 
 				record := &kgo.Record{
 					Topic: "path",
+					Key:   []byte(m.Path),
 					Value: message,
 				}
 
@@ -180,10 +133,7 @@ func WorkMessage(dbase *db.DataBase) error {
 	return wrk.Run(context.Background())
 }
 
-type StopMsg struct {
-	ID   int64
-	Path string
-}
+// --- WORKER STOP (stop_messages) ---
 
 type WorkStatusStop struct {
 	Pool      *pgxpool.Pool
@@ -219,7 +169,7 @@ func (w *WorkStatusStop) Run(ctx context.Context) error {
 			DELETE FROM stop_messages sm
 			USING cte
 			WHERE sm.id = cte.id
-			RETURNING sm.id, sm.path
+			RETURNING sm.id, sm.path, sm.key, sm.epoch
 		`, w.BatchSize)
 		if err != nil {
 			return fmt.Errorf("work(stop): pop stop_messages: %w", err)
@@ -228,7 +178,7 @@ func (w *WorkStatusStop) Run(ctx context.Context) error {
 		var batch []StopMsg
 		for rows.Next() {
 			var m StopMsg
-			if err := rows.Scan(&m.ID, &m.Path); err != nil {
+			if err := rows.Scan(&m.ID, &m.Path, &m.Key, &m.Epoch); err != nil {
 				rows.Close()
 				return fmt.Errorf("work(stop): scan: %w", err)
 			}
@@ -269,13 +219,11 @@ func WorkStatus(dbase *db.DataBase) error {
 	}
 	defer cl.Close()
 
-	wrk := &WorkerStatus{
+	wrk := &WorkStatusStop{
 		Pool:      dbase.Pool,
 		BatchSize: 100,
-		Handle: func(ctx context.Context, msgs []VideoMsg) error {
+		Handle: func(ctx context.Context, msgs []StopMsg) error {
 			for _, m := range msgs {
-				ctx := context.Background()
-
 				message, err := json.Marshal(m)
 				if err != nil {
 					return fmt.Errorf("workStatus ERR: record Marshaling ERR: %v", err)
@@ -283,6 +231,7 @@ func WorkStatus(dbase *db.DataBase) error {
 
 				record := &kgo.Record{
 					Topic: "stop",
+					Key:   []byte(m.Path),
 					Value: message,
 				}
 

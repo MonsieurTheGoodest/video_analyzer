@@ -2,8 +2,9 @@ package db
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"orchestrator/statuses"
+	"os"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,177 +14,299 @@ type DataBase struct {
 	Pool *pgxpool.Pool
 }
 
-const defaultURL = "postgres://postgres:ergotechnolain@postgres:5432/postgres?sslmode=disable"
+const defaultURL = "postgres://postgres:password@postgres:5432/postgres?sslmode=disable"
+const initSQLPath = "./initdb/001_schema.sql"
 
 func NewDataBase(ctx context.Context) (*DataBase, error) {
 	poolConfig, err := pgxpool.ParseConfig(defaultURL)
-
 	if err != nil {
 		return nil, fmt.Errorf("configuration ERR: %v", err)
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
-
 	if err != nil {
 		return nil, fmt.Errorf("connection ERR: %v", err)
 	}
 
-	dataBase := DataBase{
-		Pool: pool,
+	db := &DataBase{Pool: pool}
+
+	// Инициализация таблиц
+	if err := db.initSchema(ctx); err != nil {
+		db.Pool.Close()
+		return nil, fmt.Errorf("init schema ERR: %v", err)
 	}
 
-	return &dataBase, nil
+	return db, nil
 }
 
 func (dataBase *DataBase) Close() {
 	dataBase.Pool.Close()
 }
 
-func (db *DataBase) CreateVideo(ctx context.Context, path string) error {
+func (db *DataBase) initSchema(ctx context.Context) error {
+	content, err := os.ReadFile(initSQLPath)
+	if err != nil {
+		return fmt.Errorf("cannot read initdb.sql: %w", err)
+	}
+
 	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return fmt.Errorf("cannot begin tx: %w", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer tx.Rollback(ctx)
 
-	var curStatus string
-	var curStart int64
-
-	err = tx.QueryRow(ctx, `
-		SELECT status, start_frame
-		FROM videos
-		WHERE path = $1
-		FOR UPDATE
-	`, path).Scan(&curStatus, &curStart)
-
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO videos(path, status, start_frame)
-			VALUES ($1, 'running', 0)
-		`, path); err != nil {
-			return fmt.Errorf("insert videos: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO video_messages(path, start_frame)
-			VALUES ($1, 0)
-		`, path); err != nil {
-			return fmt.Errorf("insert video_messages: %w", err)
-		}
-
-	case err != nil:
-		return fmt.Errorf("select videos: %w", err)
-
-	default:
-		if curStatus == "ended" || curStatus == "running" {
-			if err := tx.Commit(ctx); err != nil {
-				return fmt.Errorf("commit no-op: %w", err)
-			}
-			return nil
-		}
-
-		if curStatus == "stop" {
-			if _, err := tx.Exec(ctx, `
-				UPDATE videos
-				SET status = 'running'
-				WHERE path = $1
-			`, path); err != nil {
-				return fmt.Errorf("update videos: %w", err)
-			}
-
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO video_messages(path, start_frame)
-				VALUES ($1, $2)
-			`, path, curStart); err != nil {
-				return fmt.Errorf("insert video_messages after stop->running: %w", err)
-			}
-		}
+	// Выполняем SQL из файла
+	_, err = tx.Exec(ctx, string(content))
+	if err != nil {
+		return fmt.Errorf("schema execution ERR: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit: %w", err)
+		return fmt.Errorf("schema commit ERR: %w", err)
 	}
+
 	return nil
 }
 
 func (db *DataBase) ChangeStatus(ctx context.Context, path string) error {
 	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin tx: %v", err)
+		return err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer tx.Rollback(ctx)
 
-	cmdTag, err := tx.Exec(ctx, `
-		WITH updated AS (
-		UPDATE videos
-		SET status = 'stop'
-		WHERE path = $1 AND status = 'running'
-		RETURNING 1
-		)
-		INSERT INTO stop_message(path)
-		SELECT $1
-		FROM updated;
-		`, path)
+	var status string
+	var epoch int
+	err = tx.QueryRow(ctx, `
+        SELECT status, epoch FROM videos WHERE path = $1 FOR UPDATE
+    `, path).Scan(&status, &epoch)
 	if err != nil {
-		return fmt.Errorf("exec: %v", err)
+		// нет записи — ничего не делаем
+		return nil
 	}
 
-	_ = cmdTag.RowsAffected()
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit: %v", err)
+	if status != statuses.Running {
+		return nil
 	}
-	return nil
+
+	// 1) Обновляем статус
+	_, err = tx.Exec(ctx, `
+        UPDATE videos SET status = $1 WHERE path = $2
+    `, statuses.Stopped, path)
+	if err != nil {
+		return err
+	}
+
+	// 2) Добавляем в stop_messages
+	_, err = tx.Exec(ctx, `
+        INSERT INTO stop_messages(path, "key", epoch)
+        VALUES ($1, $2, $3)
+    `, path, fmt.Sprintf("stop_%d", epoch), epoch)
+	if err != nil {
+		return err
+	}
+
+	// 3) Удаляем из current_processes
+	_, err = tx.Exec(ctx, `
+        DELETE FROM current_processes WHERE path = $1
+    `, path)
+	if err != nil {
+		return err
+	}
+
+	// 4) Увеличиваем epoch
+	_, err = tx.Exec(ctx, `
+        UPDATE videos SET epoch = epoch + 1 WHERE path = $1
+    `, path)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (db *DataBase) CreateVideo(ctx context.Context, path string) error {
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var status string
+	var startFrame int
+	var epoch int
+	var exists bool
+
+	err = tx.QueryRow(ctx, `
+		SELECT status, start_frame, epoch FROM videos WHERE path = $1 FOR UPDATE
+	`, path).Scan(&status, &startFrame, &epoch)
+	if err != nil {
+		exists = false
+	} else {
+		exists = true
+	}
+
+	if exists && status != statuses.Stopped {
+		return nil // ничего не делаем
+	}
+
+	if !exists {
+		// создаем новую запись
+		_, err = tx.Exec(ctx, `
+			INSERT INTO videos(path, status, start_frame, epoch)
+			VALUES ($1, $2, $3, $4)
+		`, path, statuses.Waiting, -1, 0)
+		if err != nil {
+			return err
+		}
+	} else {
+		// 1) Меняем статус
+		_, err = tx.Exec(ctx, `
+			UPDATE videos SET status = $1 WHERE path = $2
+		`, statuses.Waiting, path)
+		if err != nil {
+			return err
+		}
+	}
+
+	// 2) Добавляем в video_messages
+	_, err = tx.Exec(ctx, `
+		INSERT INTO video_messages(path, start_frame, epoch)
+		VALUES ($1, $2, $3)
+	`, path, startFrame, epoch)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (db *DataBase) SetEndOfScenario(ctx context.Context, path string) error {
-	tag, err := db.Pool.Exec(ctx, `
-		UPDATE videos
-		SET status = 'ended'
-		WHERE path = $1 AND status <> 'ended'
-	`, path)
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("update videos: %v", err)
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// блокируем строку
+	_, err = tx.Exec(ctx, `SELECT 1 FROM videos WHERE path = $1 FOR UPDATE`, path)
+	if err != nil {
+		return err
 	}
 
-	_ = tag.RowsAffected()
+	// 1) Меняем статус
+	_, err = tx.Exec(ctx, `
+		UPDATE videos SET status = $1 WHERE path = $2
+	`, statuses.Ended, path)
+	if err != nil {
+		return err
+	}
 
-	return nil
+	// 2) Удаляем из current_processes
+	_, err = tx.Exec(ctx, `
+		DELETE FROM current_processes WHERE path = $1
+	`, path)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (db *DataBase) SetStartOfScenario(ctx context.Context, path string) error {
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// блокируем строку
+	_, err = tx.Exec(ctx, `SELECT 1 FROM videos WHERE path = $1 FOR UPDATE`, path)
+	if err != nil {
+		return err
+	}
+
+	// 1) Меняем статус
+	_, err = tx.Exec(ctx, `
+		UPDATE videos SET status = $1 WHERE path = $2
+	`, statuses.Running, path)
+	if err != nil {
+		return err
+	}
+
+	// 2) Добавляем в current_processes
+	_, err = tx.Exec(ctx, `
+		INSERT INTO current_processes(path, start_frame)
+		VALUES ($1, -1)
+		ON CONFLICT (path) DO NOTHING
+	`, path)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (db *DataBase) AddObject(ctx context.Context, path, object string, startFrame int64) error {
-	tag, err := db.Pool.Exec(ctx, `
-		UPDATE videos
-		SET "object" = CASE
-				WHEN "object" = '' THEN $2
-				ELSE "object" || ',' || $2
-			END,
-		    start_frame = $3
-		WHERE "path" = $1
-	`, path, object, startFrame)
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("update videos: %w", err)
+		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("video not found for path=%q", path)
-	}
-	return nil
-}
+	defer tx.Rollback(ctx)
 
-func (db *DataBase) DeleteStopMessage(ctx context.Context, path string) error {
-	tag, err := db.Pool.Exec(ctx, `DELETE FROM stop_messages WHERE path = $1`, path)
-	if err != nil {
-		return fmt.Errorf("delete stop_messages: %w", err)
-	}
-	_ = tag.RowsAffected()
-	return nil
-}
+	var status string
+	var existingObject string
+	var currentStartFrame int64
 
-func (db *DataBase) DeleteVideoMessage(ctx context.Context, path string) error {
-	tag, err := db.Pool.Exec(ctx, `DELETE FROM video_messages WHERE path = $1`, path)
+	err = tx.QueryRow(ctx, `
+		SELECT status, "object", start_frame FROM videos WHERE path = $1 FOR UPDATE
+	`, path).Scan(&status, &existingObject, &currentStartFrame)
 	if err != nil {
-		return fmt.Errorf("delete video_messages: %w", err)
+		return nil // нет записи — ничего не делаем
 	}
-	_ = tag.RowsAffected()
-	return nil
+
+	if status != statuses.Waiting && status != statuses.Running {
+		return nil
+	}
+
+	if status == statuses.Waiting {
+		// -1) Меняем статус
+		_, err = tx.Exec(ctx, `
+			UPDATE videos SET status = $1 WHERE path = $2
+		`, statuses.Running, path)
+		if err != nil {
+			return err
+		}
+
+		// 0) Добавляем в current_processes
+		_, err = tx.Exec(ctx, `
+			INSERT INTO current_processes(path, start_frame)
+			VALUES ($1, $2)
+			ON CONFLICT (path) DO NOTHING
+		`, path, startFrame)
+		if err != nil {
+			return err
+		}
+	}
+
+	// 1) Добавляем объект к текущему
+	newObject := existingObject + " " + object
+	_, err = tx.Exec(ctx, `
+		UPDATE videos SET "object" = $1 WHERE path = $2
+	`, newObject, path)
+	if err != nil {
+		return err
+	}
+
+	// 2) Обновляем start_frame на максимум
+	if startFrame > currentStartFrame {
+		_, err = tx.Exec(ctx, `
+			UPDATE videos SET start_frame = $1 WHERE path = $2
+		`, startFrame, path)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
 }
