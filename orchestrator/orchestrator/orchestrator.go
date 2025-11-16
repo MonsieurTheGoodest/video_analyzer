@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"orchestrator/db"
 
@@ -16,7 +17,12 @@ type object struct {
 	Epoch  int64  `json:"epoch"`
 }
 
-func ChangeStatus(db *db.DataBase) error {
+type ending struct {
+	EndPath string `json:"end_path"`
+	Epoch   int64  `json:"epoch"`
+}
+
+func ChangeStatus(dataBase *db.DataBase) error {
 	seeds := []string{
 		"kafka_api_to_orchestrator1:9092",
 		"kafka_api_to_orchestrator2:9092",
@@ -28,7 +34,6 @@ func ChangeStatus(db *db.DataBase) error {
 		kgo.ConsumerGroup("changeStatus"),
 		kgo.ConsumeTopics("status"),
 		kgo.DisableAutoCommit(),
-		kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
@@ -60,7 +65,12 @@ func ChangeStatus(db *db.DataBase) error {
 				return fmt.Errorf("changeStatus ERR: record Unmarshaling ERR: %v", err)
 			}
 
-			err = db.ChangeStatus(context.Background(), path)
+			err = dataBase.ChangeStatus(context.Background(), path)
+
+			if errors.Is(err, db.ErrVideoNotFound) {
+				fmt.Println("changeStatus wrong path")
+				continue
+			}
 
 			if err != nil {
 				return fmt.Errorf("changeStatus ERR: db changing status ERR: %v", err)
@@ -75,7 +85,7 @@ func ChangeStatus(db *db.DataBase) error {
 	}
 }
 
-func ProcessScenario(db *db.DataBase) error {
+func ProcessScenario(dataBase *db.DataBase) error {
 	seeds := []string{
 		"kafka_api_to_orchestrator1:9092",
 		"kafka_api_to_orchestrator2:9092",
@@ -87,7 +97,6 @@ func ProcessScenario(db *db.DataBase) error {
 		kgo.ConsumerGroup("processScenario"),
 		kgo.ConsumeTopics("path"),
 		kgo.DisableAutoCommit(),
-		kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
@@ -121,7 +130,7 @@ func ProcessScenario(db *db.DataBase) error {
 				return fmt.Errorf("processScenario ERR: record Unmarshaling ERR: %v", err)
 			}
 
-			err = db.CreateVideo(context.Background(), path)
+			err = dataBase.CreateVideo(context.Background(), path)
 
 			if err != nil {
 				return fmt.Errorf("processScenario ERR: db creating video ERR: %v", err)
@@ -136,14 +145,13 @@ func ProcessScenario(db *db.DataBase) error {
 	}
 }
 
-func GetObject(db *db.DataBase) error {
-	seeds := []string{"kafka_inference_to_orchestrator1:9092"}
+func GetObject(dataBase *db.DataBase) error {
+	seeds := []string{"kafka_inference_and_orchestrator1:9092"}
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
 		kgo.ConsumerGroup("getObject"),
 		kgo.ConsumeTopics("objects"),
-		kgo.AllowAutoTopicCreation(),
 		kgo.DisableAutoCommit(),
 	)
 
@@ -180,7 +188,7 @@ func GetObject(db *db.DataBase) error {
 				return fmt.Errorf("getObject ERR: record Unmarshaling ERR: %v", err)
 			}
 
-			err = db.AddObject(context.Background(), obj.Path, obj.Object, obj.ID)
+			err = dataBase.AddObject(context.Background(), obj.Path, obj.Object, obj.ID, obj.Epoch)
 
 			if err != nil {
 				return fmt.Errorf("getObject ERR: %v", err)
@@ -189,7 +197,7 @@ func GetObject(db *db.DataBase) error {
 	}
 }
 
-func SetEnd(db *db.DataBase) error {
+func SetEnd(dataBase *db.DataBase) error {
 	seeds := []string{
 		"kafka_orchestrator_and_runner1:9092",
 		"kafka_orchestrator_and_runner2:9092",
@@ -201,7 +209,6 @@ func SetEnd(db *db.DataBase) error {
 		kgo.ConsumerGroup("setEnd"),
 		kgo.ConsumeTopics("end"),
 		kgo.DisableAutoCommit(),
-		kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
@@ -227,15 +234,15 @@ func SetEnd(db *db.DataBase) error {
 				return fmt.Errorf("setEnd ERR: refusing to send empty value")
 			}
 
-			var path string
+			end := ending{}
 
-			err = json.Unmarshal(record.Value, &path)
+			err = json.Unmarshal(record.Value, &end)
 
 			if err != nil {
 				return fmt.Errorf("setEnd ERR: record Unmarshaling ERR: %v", err)
 			}
 
-			err = db.SetEndOfScenario(context.Background(), path)
+			err = dataBase.SetEndOfScenario(context.Background(), end.EndPath, end.Epoch)
 
 			if err != nil {
 				return fmt.Errorf("setEnd ERR: setting end ERR: %v", err)
@@ -250,7 +257,7 @@ func SetEnd(db *db.DataBase) error {
 	}
 }
 
-func SetStart(db *db.DataBase) error {
+func DeleteScenario(dataBase *db.DataBase) error {
 	seeds := []string{
 		"kafka_orchestrator_and_runner1:9092",
 		"kafka_orchestrator_and_runner2:9092",
@@ -259,14 +266,13 @@ func SetStart(db *db.DataBase) error {
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
-		kgo.ConsumerGroup("setStart"),
-		kgo.ConsumeTopics("start"),
+		kgo.ConsumerGroup("deleteScenario"),
+		kgo.ConsumeTopics("delete"),
 		kgo.DisableAutoCommit(),
-		kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
-		return fmt.Errorf("setStart ERR: client creating ERR: %v", err)
+		return fmt.Errorf("deleteScenario ERR: client creating ERR: %v", err)
 	}
 	defer cl.Close()
 
@@ -276,7 +282,7 @@ func SetStart(db *db.DataBase) error {
 		fetches := cl.PollFetches(ctx)
 
 		if errs := fetches.Errors(); len(errs) > 0 {
-			return fmt.Errorf("setStart ERR: fetching message ERR: %v", errs)
+			return fmt.Errorf("deleteScenario ERR: fetching message ERR: %v", errs)
 		}
 
 		iter := fetches.RecordIter()
@@ -285,7 +291,7 @@ func SetStart(db *db.DataBase) error {
 			record := iter.Next()
 
 			if record == nil || len(record.Value) == 0 {
-				return fmt.Errorf("setStart ERR: refusing to send empty value")
+				return fmt.Errorf("deleteScenario ERR: refusing to send empty value")
 			}
 
 			var path string
@@ -293,19 +299,19 @@ func SetStart(db *db.DataBase) error {
 			err = json.Unmarshal(record.Value, &path)
 
 			if err != nil {
-				return fmt.Errorf("setStart ERR: record Unmarshaling ERR: %v", err)
+				return fmt.Errorf("deleteScenario ERR: record Unmarshaling ERR: %v", err)
 			}
 
-			err = db.SetStartOfScenario(context.Background(), path)
+			err = dataBase.DeleteScenario(context.Background(), path)
 
 			if err != nil {
-				return fmt.Errorf("setStart ERR: setting start ERR: %v", err)
+				return fmt.Errorf("deleteScenario ERR: setting end ERR: %v", err)
 			}
 
 			err = cl.CommitUncommittedOffsets(context.Background())
 
 			if err != nil {
-				return fmt.Errorf("setStart ERR: offset commiting ERR: %v", err)
+				return fmt.Errorf("deleteScenario ERR: offset commiting ERR: %v", err)
 			}
 		}
 	}

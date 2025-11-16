@@ -11,8 +11,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// --- STRUCTS ---
-
 type VideoMsg struct {
 	ID         int64  `json:"id"`
 	Path       string `json:"path"`
@@ -21,13 +19,10 @@ type VideoMsg struct {
 }
 
 type StopMsg struct {
-	ID    int64  `json:"id"`
-	Path  string `json:"path"`
-	Key   string `json:"key"`
-	Epoch int64  `json:"epoch"`
+	ID       int64  `json:"id"`
+	StopPath string `json:"stop_path"`
+	Epoch    int64  `json:"epoch"`
 }
-
-// --- WORKER STATUS (video_messages) ---
 
 type WorkerStatus struct {
 	Pool      *pgxpool.Pool
@@ -99,7 +94,6 @@ func WorkMessage(dbase *db.DataBase) error {
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
-		kgo.AllowAutoTopicCreation(),
 	)
 	if err != nil {
 		return fmt.Errorf("workMessage ERR: client creating ERR: %v", err)
@@ -132,8 +126,6 @@ func WorkMessage(dbase *db.DataBase) error {
 
 	return wrk.Run(context.Background())
 }
-
-// --- WORKER STOP (stop_messages) ---
 
 type WorkStatusStop struct {
 	Pool      *pgxpool.Pool
@@ -169,7 +161,7 @@ func (w *WorkStatusStop) Run(ctx context.Context) error {
 			DELETE FROM stop_messages sm
 			USING cte
 			WHERE sm.id = cte.id
-			RETURNING sm.id, sm.path, sm.key, sm.epoch
+			RETURNING sm.id, sm.path, sm.epoch
 		`, w.BatchSize)
 		if err != nil {
 			return fmt.Errorf("work(stop): pop stop_messages: %w", err)
@@ -178,7 +170,7 @@ func (w *WorkStatusStop) Run(ctx context.Context) error {
 		var batch []StopMsg
 		for rows.Next() {
 			var m StopMsg
-			if err := rows.Scan(&m.ID, &m.Path, &m.Key, &m.Epoch); err != nil {
+			if err := rows.Scan(&m.ID, &m.StopPath, &m.Epoch); err != nil {
 				rows.Close()
 				return fmt.Errorf("work(stop): scan: %w", err)
 			}
@@ -212,7 +204,6 @@ func WorkStatus(dbase *db.DataBase) error {
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
-		kgo.AllowAutoTopicCreation(),
 	)
 	if err != nil {
 		return fmt.Errorf("workStatus ERR: client creating ERR: %v", err)
@@ -231,7 +222,7 @@ func WorkStatus(dbase *db.DataBase) error {
 
 				record := &kgo.Record{
 					Topic: "stop",
-					Key:   []byte(m.Path),
+					Key:   []byte(m.StopPath),
 					Value: message,
 				}
 

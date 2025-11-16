@@ -4,9 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )
+
+type Meta struct {
+	Status     string `json:"status"`
+	StartFrame int64  `json:"start_frame"`
+	Epoch      int64  `json:"epoch"`
+}
+
+type ObjectResponse struct {
+	Object string `json:"object"`
+}
+
+const orchestratorBase = "http://orchestrator:9000"
 
 func ProcessScenario(path string) error {
 	seeds := []string{
@@ -17,7 +30,6 @@ func ProcessScenario(path string) error {
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
-		kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
@@ -49,6 +61,10 @@ func ProcessScenario(path string) error {
 }
 
 func ChangeStatusScenario(path string, status string) error {
+	if status != "stop" {
+		return fmt.Errorf("changeStatusScenario should be 'stop' ERR")
+	}
+
 	seeds := []string{
 		"kafka_api_to_orchestrator1:9092",
 		"kafka_api_to_orchestrator2:9092",
@@ -57,7 +73,6 @@ func ChangeStatusScenario(path string, status string) error {
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
-		kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
@@ -67,7 +82,7 @@ func ChangeStatusScenario(path string, status string) error {
 
 	ctx := context.Background()
 
-	b, err := json.Marshal(status)
+	b, err := json.Marshal(path)
 
 	if err != nil {
 		return fmt.Errorf("changeStatusScenario ERR: marshaling ERR: %v", err)
@@ -86,13 +101,94 @@ func ChangeStatusScenario(path string, status string) error {
 	}
 
 	return nil
-
 }
 
-func Objects(path string) (string, error) {
-	return "", nil
+func ProcessScenarioHandler(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "missing 'path' parameter", http.StatusBadRequest)
+		return
+	}
+
+	if err := ProcessScenario(path); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-func Status(path string) (string, error) {
-	return "", nil
+func ChangeStatusHandler(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	status := r.URL.Query().Get("status")
+
+	if path == "" || status == "" {
+		http.Error(w, "missing 'path' or 'status' parameter", http.StatusBadRequest)
+		return
+	}
+
+	if err := ChangeStatusScenario(path, status); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func GetObjectsHandler(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "missing 'path' parameter", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := http.Get(fmt.Sprintf("%s/object?path=%s", orchestratorBase, path))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error contacting orchestrator: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write([]byte(readBody(resp)))
+}
+
+func GetMetaHandler(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "missing 'path' parameter", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := http.Get(fmt.Sprintf("%s/meta?path=%s", orchestratorBase, path))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error contacting orchestrator: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write([]byte(readBody(resp)))
+}
+
+func readBody(resp *http.Response) string {
+	defer resp.Body.Close()
+	buf := make([]byte, resp.ContentLength)
+	resp.Body.Read(buf)
+	return string(buf)
+}
+
+func GetCurrentProcessesHandler(w http.ResponseWriter, r *http.Request) {
+	resp, err := http.Get(fmt.Sprintf("%s/processes", orchestratorBase))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error contacting orchestrator: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write([]byte(readBody(resp)))
 }

@@ -24,5 +24,5 @@ CREATE TABLE IF NOT EXISTS stop_messages (
 CREATE TABLE IF NOT EXISTS current_processes (
     id SERIAL PRIMARY KEY,
     "path" TEXT NOT NULL UNIQUE,
-    start_frame INT DEFAULT -1
-)
+    change_time TIMESTAMPTZ DEFAULT NOW()
+);

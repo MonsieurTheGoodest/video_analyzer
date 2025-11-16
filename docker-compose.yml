@@ -40,7 +40,7 @@ x-runner_to_inference-base: &kafka_runner_to_inference
 
     KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka_runner_to_inference1:9093
 
-x-inference_to_orchestrator-base: &kafka_inference_to_orchestrator
+x-inference_and_orchestrator-base: &kafka_inference_and_orchestrator
     CLUSTER_ID: uOoH8QmDRoyujZgSUESBuA
     KAFKA_NUM_PARTITIONS: 1
     KAFKA_DEFAULT_REPLICATION_FACTOR: 1
@@ -48,7 +48,7 @@ x-inference_to_orchestrator-base: &kafka_inference_to_orchestrator
     KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
 
-    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka_inference_to_orchestrator1:9093
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka_inference_and_orchestrator1:9093
 
 x-kafka-env: &kafka-env
     KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
@@ -156,15 +156,15 @@ services:
         ports:
             - 39091:29092
 
-    kafka_inference_to_orchestrator1:
+    kafka_inference_and_orchestrator1:
         <<: *kafka-base
 
         environment:
             <<: 
                 - *kafka-env
-                - *kafka_inference_to_orchestrator
+                - *kafka_inference_and_orchestrator
             KAFKA_NODE_ID: 1
-            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_inference_to_orchestrator1:9092,EXTERNAL://host.docker.internal:49091
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_inference_and_orchestrator1:9092,EXTERNAL://host.docker.internal:49091
             
         ports:
             - 49091:29092
@@ -200,8 +200,44 @@ services:
             - /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_runner_to_inference1:9092 --create --if-not-exists --topic frames \
                 --config max.message.bytes=10000000 \
                 && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_runner_to_inference1:9092 --list
+    
+    init_api_to_orchestrator:
+        image: apache/kafka:4.0.1
+        restart: "no"
+        networks: [internet]
+        depends_on:
+            kafka_api_to_orchestrator1:
+                condition: service_healthy
+            kafka_api_to_orchestrator2:
+                condition: service_healthy
+            kafka_api_to_orchestrator3:
+                condition: service_healthy
+        entrypoint:
+            - /bin/sh
+            - -exc
+            - /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_api_to_orchestrator1:9092 --create --if-not-exists --topic path \
+                && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_api_to_orchestrator1:9092 --create --if-not-exists --topic status \
+                && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_api_to_orchestrator3:9092 --list
 
-
+    init_orchestrator_and_runner:
+        image: apache/kafka:4.0.1
+        restart: "no"
+        networks: [internet]
+        depends_on:
+            kafka_orchestrator_and_runner1:
+                condition: service_healthy
+            kafka_orchestrator_and_runner2:
+                condition: service_healthy
+            kafka_orchestrator_and_runner3:
+                condition: service_healthy
+        entrypoint:
+            - /bin/sh
+            - -exc
+            - /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_orchestrator_and_runner1:9092 --create --if-not-exists --topic path \
+                && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_orchestrator_and_runner1:9092 --create --if-not-exists --topic stop \
+                && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_orchestrator_and_runner1:9092 --create --if-not-exists --topic delete \
+                && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_orchestrator_and_runner1:9092 --create --if-not-exists --topic end \
+                && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_orchestrator_and_runner3:9092 --list
 
     postgres:
         image: postgres:14.19-alpine3.21
@@ -214,7 +250,7 @@ services:
             retries: 5
             start_period: 10s
         environment:
-            - POSTGRES_PASSWORD=password
+            - POSTGRES_PASSWORD=ergotechnolain
         ports:
             - 65432:5432
         networks:
@@ -236,6 +272,8 @@ services:
                 condition: service_healthy
             kafka_api_to_orchestrator3:
                 condition: service_healthy
+        ports:
+            - 9000:9000
     
     orchestrator:
         image: orchestrator:v01
@@ -256,10 +294,14 @@ services:
                 condition: service_healthy
             kafka_orchestrator_and_runner3:
                 condition: service_healthy
-            kafka_inference_to_orchestrator1:
+            kafka_inference_and_orchestrator1:
                 condition: service_healthy
             postgres:
                 condition: service_healthy
+            init_api_to_orchestrator: 
+                condition: service_started 
+            init_orchestrator_and_runner: 
+                condition: service_started 
 
     runner:
         image: runner:v01
@@ -277,11 +319,14 @@ services:
                 condition: service_healthy
             init_runner_to_inference: 
                 condition: service_started 
+            init_orchestrator_and_runner: 
+                condition: service_started 
         deploy:
             mode: replicated
             replicas: 3
         volumes:
             - ./runner/video/:/runner/video/
+        
             
     inference:
         image: inference:v01
@@ -290,7 +335,7 @@ services:
         networks:
             - internet
         depends_on:
-            kafka_inference_to_orchestrator1:
+            kafka_inference_and_orchestrator1:
                 condition: service_healthy
             kafka_runner_to_inference1:
                 condition: service_healthy

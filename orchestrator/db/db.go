@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"orchestrator/statuses"
 	"os"
@@ -14,8 +15,11 @@ type DataBase struct {
 	Pool *pgxpool.Pool
 }
 
-const defaultURL = "postgres://postgres:password@postgres:5432/postgres?sslmode=disable"
+const defaultURL = "postgres://postgres:ergotechnolain@postgres:5432/postgres?sslmode=disable"
 const initSQLPath = "./initdb/001_schema.sql"
+
+var ErrVideoNotFound error = errors.New("video not found")
+var ErrEpochNotEqual error = errors.New("ENE")
 
 func NewDataBase(ctx context.Context) (*DataBase, error) {
 	poolConfig, err := pgxpool.ParseConfig(defaultURL)
@@ -30,7 +34,6 @@ func NewDataBase(ctx context.Context) (*DataBase, error) {
 
 	db := &DataBase{Pool: pool}
 
-	// Инициализация таблиц
 	if err := db.initSchema(ctx); err != nil {
 		db.Pool.Close()
 		return nil, fmt.Errorf("init schema ERR: %v", err)
@@ -55,7 +58,6 @@ func (db *DataBase) initSchema(ctx context.Context) error {
 	}
 	defer tx.Rollback(ctx)
 
-	// Выполняем SQL из файла
 	_, err = tx.Exec(ctx, string(content))
 	if err != nil {
 		return fmt.Errorf("schema execution ERR: %w", err)
@@ -71,7 +73,7 @@ func (db *DataBase) initSchema(ctx context.Context) error {
 func (db *DataBase) ChangeStatus(ctx context.Context, path string) error {
 	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("changeStatus ERR: starting transaction ERR: %v", err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -80,46 +82,46 @@ func (db *DataBase) ChangeStatus(ctx context.Context, path string) error {
 	err = tx.QueryRow(ctx, `
         SELECT status, epoch FROM videos WHERE path = $1 FOR UPDATE
     `, path).Scan(&status, &epoch)
+
 	if err != nil {
-		// нет записи — ничего не делаем
-		return nil
+		if errors.Is(err, pgx.ErrNoRows) {
+			fmt.Printf("path: %v\n", path)
+			return ErrVideoNotFound
+		}
+		return fmt.Errorf("changeStatus ERR: selecting ERR: %v", err)
 	}
 
 	if status != statuses.Running {
 		return nil
 	}
 
-	// 1) Обновляем статус
 	_, err = tx.Exec(ctx, `
         UPDATE videos SET status = $1 WHERE path = $2
     `, statuses.Stopped, path)
 	if err != nil {
-		return err
+		return fmt.Errorf("changeStatus ERR: changing status ERR: %v", err)
 	}
 
-	// 2) Добавляем в stop_messages
 	_, err = tx.Exec(ctx, `
         INSERT INTO stop_messages(path, "key", epoch)
         VALUES ($1, $2, $3)
     `, path, fmt.Sprintf("stop_%d", epoch), epoch)
 	if err != nil {
-		return err
+		return fmt.Errorf("changeStatus ERR: adding into stop_messages ERR: %v", err)
 	}
 
-	// 3) Удаляем из current_processes
 	_, err = tx.Exec(ctx, `
         DELETE FROM current_processes WHERE path = $1
     `, path)
 	if err != nil {
-		return err
+		return fmt.Errorf("changeStatus ERR: deleting from current_processes ERR: %v", err)
 	}
 
-	// 4) Увеличиваем epoch
 	_, err = tx.Exec(ctx, `
         UPDATE videos SET epoch = epoch + 1 WHERE path = $1
     `, path)
 	if err != nil {
-		return err
+		return fmt.Errorf("changeStatus ERR: increasing epoch ERR: %v", err)
 	}
 
 	return tx.Commit(ctx)
@@ -128,13 +130,14 @@ func (db *DataBase) ChangeStatus(ctx context.Context, path string) error {
 func (db *DataBase) CreateVideo(ctx context.Context, path string) error {
 	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("createVideo ERR: starting transaction ERR: %v", err)
 	}
 	defer tx.Rollback(ctx)
 
 	var status string
-	var startFrame int
-	var epoch int
+
+	var startFrame int64
+	var epoch int64
 	var exists bool
 
 	err = tx.QueryRow(ctx, `
@@ -147,166 +150,345 @@ func (db *DataBase) CreateVideo(ctx context.Context, path string) error {
 	}
 
 	if exists && status != statuses.Stopped {
-		return nil // ничего не делаем
+		return nil
 	}
 
 	if !exists {
-		// создаем новую запись
 		_, err = tx.Exec(ctx, `
 			INSERT INTO videos(path, status, start_frame, epoch)
 			VALUES ($1, $2, $3, $4)
 		`, path, statuses.Waiting, -1, 0)
 		if err != nil {
-			return err
+			return fmt.Errorf("createVideo ERR: creating scenario ERR: %v", err)
 		}
 	} else {
-		// 1) Меняем статус
 		_, err = tx.Exec(ctx, `
 			UPDATE videos SET status = $1 WHERE path = $2
 		`, statuses.Waiting, path)
 		if err != nil {
-			return err
+			return fmt.Errorf("createVideo ERR: changing status ERR: %v", err)
 		}
 	}
 
-	// 2) Добавляем в video_messages
 	_, err = tx.Exec(ctx, `
 		INSERT INTO video_messages(path, start_frame, epoch)
 		VALUES ($1, $2, $3)
 	`, path, startFrame, epoch)
 	if err != nil {
-		return err
+		return fmt.Errorf("createVideo ERR: adding into video_messages ERR: %v", err)
 	}
 
 	return tx.Commit(ctx)
 }
 
-func (db *DataBase) SetEndOfScenario(ctx context.Context, path string) error {
+func (db *DataBase) SetEndOfScenario(ctx context.Context, path string, epoch int64) error {
 	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("setEndOfScenario ERR: starting transaction ERR: %v", err)
 	}
 	defer tx.Rollback(ctx)
 
-	// блокируем строку
-	_, err = tx.Exec(ctx, `SELECT 1 FROM videos WHERE path = $1 FOR UPDATE`, path)
+	var dbStatus string
+	var dbEpoch int64
+
+	err = tx.QueryRow(ctx, `
+		SELECT status, epoch
+		FROM videos
+		WHERE path = $1
+		FOR UPDATE
+	`, path).Scan(&dbStatus, &dbEpoch)
 	if err != nil {
-		return err
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrVideoNotFound
+		}
+		return fmt.Errorf("setEndOfScenario ERR: reading video data ERR: %v", err)
 	}
 
-	// 1) Меняем статус
+	if dbStatus != statuses.Running || dbEpoch != epoch {
+		return nil
+	}
+
 	_, err = tx.Exec(ctx, `
-		UPDATE videos SET status = $1 WHERE path = $2
+		UPDATE videos
+		SET status = $1
+		WHERE path = $2
 	`, statuses.Ended, path)
 	if err != nil {
-		return err
+		return fmt.Errorf("setEndOfScenario ERR: changing status ERR: %v", err)
 	}
 
-	// 2) Удаляем из current_processes
 	_, err = tx.Exec(ctx, `
-		DELETE FROM current_processes WHERE path = $1
+		DELETE FROM current_processes
+		WHERE path = $1
 	`, path)
 	if err != nil {
-		return err
+		return fmt.Errorf("setEndOfScenario ERR: deleting from current_processes ERR: %v", err)
 	}
 
 	return tx.Commit(ctx)
 }
 
-func (db *DataBase) SetStartOfScenario(ctx context.Context, path string) error {
+func (db *DataBase) SetStartOfScenario(ctx context.Context, path string, epoch int64) error {
+	fmt.Printf("starting setting running. path: %v, epoch: %v\n", path, epoch)
+
 	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("setStartOfScenario ERR: starting transaction ERR: %v", err)
 	}
 	defer tx.Rollback(ctx)
 
-	// блокируем строку
-	_, err = tx.Exec(ctx, `SELECT 1 FROM videos WHERE path = $1 FOR UPDATE`, path)
+	var status string
+	var dbEpoch int64
+
+	err = tx.QueryRow(ctx, `
+		SELECT status, epoch 
+		FROM videos 
+		WHERE path = $1 
+		FOR UPDATE
+	`, path).Scan(&status, &dbEpoch)
 	if err != nil {
-		return err
+		return fmt.Errorf("setStartOfScenario ERR: reading video data ERR: %v", err)
 	}
 
-	// 1) Меняем статус
+	if status == statuses.Ended || epoch < dbEpoch {
+		return ErrEpochNotEqual
+	}
+
 	_, err = tx.Exec(ctx, `
-		UPDATE videos SET status = $1 WHERE path = $2
+		UPDATE videos 
+		SET status = $1 
+		WHERE path = $2
 	`, statuses.Running, path)
 	if err != nil {
-		return err
+		return fmt.Errorf("setStartOfScenario ERR: changing status ERR: %v", err)
 	}
 
-	// 2) Добавляем в current_processes
 	_, err = tx.Exec(ctx, `
-		INSERT INTO current_processes(path, start_frame)
-		VALUES ($1, -1)
+		INSERT INTO current_processes(path, change_time)
+		VALUES ($1, NOW())
 		ON CONFLICT (path) DO NOTHING
 	`, path)
 	if err != nil {
-		return err
+		return fmt.Errorf("setStartOfScenario ERR: adding into current_processes ERR: %v", err)
 	}
 
 	return tx.Commit(ctx)
 }
 
-func (db *DataBase) AddObject(ctx context.Context, path, object string, startFrame int64) error {
+func (db *DataBase) AddObject(ctx context.Context, path, object string, startFrame, epoch int64) error {
 	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("addObject ERR: starting transaction ERR: %v", err)
 	}
 	defer tx.Rollback(ctx)
 
 	var status string
 	var existingObject string
 	var currentStartFrame int64
+	var dbEpoch int64
 
 	err = tx.QueryRow(ctx, `
-		SELECT status, "object", start_frame FROM videos WHERE path = $1 FOR UPDATE
-	`, path).Scan(&status, &existingObject, &currentStartFrame)
+		SELECT status, "object", start_frame, epoch 
+		FROM videos 
+		WHERE path = $1 
+		FOR UPDATE
+	`, path).Scan(&status, &existingObject, &currentStartFrame, &dbEpoch)
 	if err != nil {
-		return nil // нет записи — ничего не делаем
+		return fmt.Errorf("addObject ERR: getting data ERR: %v", err)
 	}
 
-	if status != statuses.Waiting && status != statuses.Running {
+	if dbEpoch != epoch {
 		return nil
 	}
 
-	if status == statuses.Waiting {
-		// -1) Меняем статус
-		_, err = tx.Exec(ctx, `
-			UPDATE videos SET status = $1 WHERE path = $2
-		`, statuses.Running, path)
-		if err != nil {
-			return err
-		}
-
-		// 0) Добавляем в current_processes
-		_, err = tx.Exec(ctx, `
-			INSERT INTO current_processes(path, start_frame)
-			VALUES ($1, $2)
-			ON CONFLICT (path) DO NOTHING
-		`, path, startFrame)
-		if err != nil {
-			return err
-		}
+	if status != statuses.Running && status != statuses.Ended {
+		return fmt.Errorf("addObject ERR: status is %v. Should be Running or Ended. path: %v, frame: %v, epoch %v", status, path, startFrame, epoch)
 	}
 
-	// 1) Добавляем объект к текущему
 	newObject := existingObject + " " + object
 	_, err = tx.Exec(ctx, `
-		UPDATE videos SET "object" = $1 WHERE path = $2
+		UPDATE videos 
+		SET "object" = $1 
+		WHERE path = $2
 	`, newObject, path)
 	if err != nil {
-		return err
+		return fmt.Errorf("addObject ERR: adding object ERR: %v", err)
 	}
 
-	// 2) Обновляем start_frame на максимум
 	if startFrame > currentStartFrame {
 		_, err = tx.Exec(ctx, `
-			UPDATE videos SET start_frame = $1 WHERE path = $2
+			UPDATE videos 
+			SET start_frame = $1 
+			WHERE path = $2
 		`, startFrame, path)
 		if err != nil {
 			return err
 		}
 	}
 
+	_, err = tx.Exec(ctx, `
+		UPDATE current_processes 
+		SET change_time = NOW()
+		WHERE path = $1
+	`, path)
+	if err != nil {
+		return fmt.Errorf("addObject ERR: updating change_time ERR: %v", err)
+	}
+
 	return tx.Commit(ctx)
+}
+
+func (db *DataBase) Reset(ctx context.Context, path string) error {
+	fmt.Printf("starting reseting path: %v\n", path)
+
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("Reset ERR: starting transaction ERR: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var status string
+	var startFrame int64
+	var epoch int64
+
+	err = tx.QueryRow(ctx, `
+		SELECT status, start_frame, epoch FROM videos WHERE path = $1 FOR UPDATE
+	`, path).Scan(&status, &startFrame, &epoch)
+	if err != nil {
+		return fmt.Errorf("Reset ERR: getting data: %v", err)
+	}
+
+	if status != statuses.Running {
+		return nil
+	}
+
+	_, err = tx.Exec(ctx, `
+        INSERT INTO stop_messages(path, "key", epoch)
+        VALUES ($1, $2, $3)
+    `, path, fmt.Sprintf("stop_%d", epoch), epoch)
+	if err != nil {
+		return fmt.Errorf("reset ERR: adding into stop_messages ERR: %v", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+        DELETE FROM current_processes WHERE path = $1
+    `, path)
+	if err != nil {
+		return fmt.Errorf("reset ERR: deleting from current_processes ERR: %v", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+        UPDATE videos SET epoch = epoch + 1 WHERE path = $1
+    `, path)
+	if err != nil {
+		return fmt.Errorf("reset ERR: increasing epoch ERR: %v", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+			UPDATE videos SET status = $1 WHERE path = $2
+		`, statuses.Waiting, path)
+	if err != nil {
+		return fmt.Errorf("Reset ERR: changing status ERR: %v", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO video_messages(path, start_frame, epoch)
+		VALUES ($1, $2, $3)
+	`, path, startFrame, epoch+1)
+	if err != nil {
+		return fmt.Errorf("Reset ERR: adding into video_messages ERR: %v", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (db *DataBase) GetVideoMeta(ctx context.Context, path string) (status string, startFrame, epoch int64, err error) {
+	err = db.Pool.QueryRow(ctx, `
+		SELECT status, start_frame, epoch
+		FROM videos
+		WHERE path = $1
+	`, path).Scan(&status, &startFrame, &epoch)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			fmt.Printf("path: %v\n", path)
+			return "", -1, 0, ErrVideoNotFound
+		}
+		return "", -1, 0, fmt.Errorf("getVideoMeta ERR: %v", err)
+	}
+
+	return status, startFrame, epoch, nil
+}
+
+func (db *DataBase) GetVideoObject(ctx context.Context, path string) (object string, err error) {
+	err = db.Pool.QueryRow(ctx, `
+		SELECT "object"
+		FROM videos
+		WHERE path = $1
+	`, path).Scan(&object)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			fmt.Printf("path: %v\n", path)
+			return "", ErrVideoNotFound
+		}
+		return "", fmt.Errorf("getVideoObject ERR: %v", err)
+	}
+
+	return object, nil
+}
+
+func (db *DataBase) DeleteScenario(ctx context.Context, path string) error {
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("deleteScenario ERR: starting transaction ERR: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var exists bool
+	err = tx.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM videos WHERE path = $1)
+	`, path).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("deleteScenario ERR: checking existence ERR: %v", err)
+	}
+
+	if !exists {
+		return fmt.Errorf("deleteScenario ERR: video not found")
+	}
+
+	_, err = tx.Exec(ctx, `
+		DELETE FROM videos WHERE path = $1
+	`, path)
+	if err != nil {
+		return fmt.Errorf("deleteScenario ERR: deleting from videos ERR: %v", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (db *DataBase) GetCurrentProcesses(ctx context.Context) ([]string, error) {
+	rows, err := db.Pool.Query(ctx, `
+		SELECT path 
+		FROM current_processes
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("getAllCurrentProcesses ERR: querying ERR: %v", err)
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("getAllCurrentProcesses ERR: scanning ERR: %v", err)
+		}
+		paths = append(paths, path)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("getAllCurrentProcesses ERR: rows ERR: %v", err)
+	}
+
+	return paths, nil
 }

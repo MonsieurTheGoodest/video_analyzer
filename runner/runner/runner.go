@@ -3,7 +3,12 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
 	"time"
 
 	vidio "github.com/AlexEidt/Vidio"
@@ -14,6 +19,7 @@ type image struct {
 	Frame []byte `json:"frame"`
 	Path  string `json:"path"`
 	ID    int64  `json:"id"`
+	Epoch int64  `json:"epoch"`
 }
 
 type Processor struct {
@@ -25,22 +31,23 @@ type Processor struct {
 
 type stopping struct {
 	StopPath string `json:"stop_path"`
-	Key      string `json:"key"`
 	Epoch    int64  `json:"epoch"`
-	tm       time.Time
 }
 
-func (s *stopping) isEqual(s1 *stopping) bool {
-	return s.StopPath == s1.StopPath && s.Key == s1.Key && s.Epoch == s1.Epoch
+type ending struct {
+	EndPath string `json:"end_path"`
+	Epoch   int64  `json:"epoch"`
 }
 
 func NewProcessor() *Processor {
 	return &Processor{}
 }
 
-const skipTime = time.Second * 5
-const heartbeatInterval = time.Second * 3
-const sessionTimeout = time.Second * 15
+var ErrVideoNotFound error = errors.New("video not found")
+var ErrEpochNotEqual error = errors.New("ENE")
+
+const heartbeatInterval = time.Second * 5
+const sessionTimeout = time.Second * 45
 
 func (p *Processor) CheckStopping() error {
 	seeds := []string{
@@ -51,9 +58,9 @@ func (p *Processor) CheckStopping() error {
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
-		kgo.ConsumerGroup("checkStopping"),
+		kgo.ConsumerGroup(fmt.Sprint(os.Getpid())),
 		kgo.ConsumeTopics("stop"),
-		kgo.AllowAutoTopicCreation(),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.DisableAutoCommit(),
 	)
 
@@ -61,8 +68,6 @@ func (p *Processor) CheckStopping() error {
 		return fmt.Errorf("checkStopping ERR: client creating ERR: %v", err)
 	}
 	defer cl.Close()
-
-	lastStopping := stopping{}
 
 	for {
 		fetches := cl.PollFetches(context.Background())
@@ -73,7 +78,7 @@ func (p *Processor) CheckStopping() error {
 
 		iter := fetches.RecordIter()
 
-		for {
+		for !iter.Done() {
 			record := iter.Next()
 
 			if record == nil || len(record.Value) == 0 {
@@ -88,29 +93,14 @@ func (p *Processor) CheckStopping() error {
 				return fmt.Errorf("checkStopping ERR: Unmarshaling ERR: %v", err)
 			}
 
-			if stp.StopPath == p.Path && stp.Epoch >= p.Epoch {
+			if stp.StopPath == p.Path && stp.Epoch >= p.Epoch && p.Path != "" {
 				p.stopped = true
-
-				err = cl.CommitUncommittedOffsets(context.Background())
-
-				if err != nil {
-					return fmt.Errorf("checkStopping ERR: commiting offsetts ERR: %v", err)
-				}
-
-				break
 			}
 
-			if !stp.isEqual(&lastStopping) {
-				lastStopping = stp
-				lastStopping.tm = time.Now()
-			} else if lastStopping.tm.Add(skipTime).Before(time.Now()) && p.Path != "" {
-				err = cl.CommitUncommittedOffsets(context.Background())
+			err = cl.CommitUncommittedOffsets(context.Background())
 
-				if err != nil {
-					return fmt.Errorf("checkStopping ERR: commiting offsetts ERR: %v", err)
-				}
-
-				break
+			if err != nil {
+				return fmt.Errorf("checkStopping ERR: commiting offsetts ERR: %v", err)
 			}
 		}
 	}
@@ -126,7 +116,6 @@ func (p *Processor) ReadPath() error {
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
 		kgo.ConsumerGroup("runner"),
-		kgo.AllowAutoTopicCreation(),
 		kgo.ConsumeTopics("path"),
 		kgo.DisableAutoCommit(),
 		kgo.HeartbeatInterval(heartbeatInterval),
@@ -139,6 +128,9 @@ func (p *Processor) ReadPath() error {
 	defer cl.Close()
 
 	ctx := context.Background()
+
+	video := vidio.Video{}
+	defer video.Close()
 
 	for {
 		fetches := cl.PollFetches(ctx)
@@ -156,8 +148,6 @@ func (p *Processor) ReadPath() error {
 				continue
 			}
 
-			cl.CommitUncommittedOffsets(context.Background())
-
 			var config Processor
 
 			err = json.Unmarshal(record.Value, &config)
@@ -166,14 +156,35 @@ func (p *Processor) ReadPath() error {
 				return fmt.Errorf("readPath ERR: record Unmarshaling ERR: %v", err)
 			}
 
+			p.Path = config.Path
+			p.Epoch = config.Epoch
+			p.stopped = false
+
+			fmt.Printf("%s started processing\n", p.Path)
+
+			if _, err := os.Stat(p.Path); errors.Is(err, os.ErrNotExist) {
+				fmt.Printf("[WARN] processScenario: video file %s not found, skipping...\n", p.Path)
+
+				delErr := p.deleteScenario()
+
+				if delErr != nil {
+					return fmt.Errorf("readPath ERR: %v", delErr)
+				}
+
+				continue
+			}
+
 			err = p.commitStartOfScenario()
+
+			if errors.Is(err, ErrEpochNotEqual) {
+				continue
+			}
 
 			if err != nil {
 				return fmt.Errorf("readPath ERR: %v", err)
 			}
 
-			p.Path = config.Path
-			p.stopped = false
+			cl.CommitUncommittedOffsets(context.Background())
 
 			err = p.processScenario()
 
@@ -193,7 +204,6 @@ func (p *Processor) commitEndOfScenario() error {
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
-		kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
@@ -201,9 +211,10 @@ func (p *Processor) commitEndOfScenario() error {
 	}
 	defer cl.Close()
 
-	ctx := context.Background()
-
-	b, err := json.Marshal(p.Path)
+	b, err := json.Marshal(ending{
+		EndPath: p.Path,
+		Epoch:   p.Epoch,
+	})
 
 	if err != nil {
 		return fmt.Errorf("commitEndOfScenario ERR: marshaling ERR: %v", err)
@@ -214,14 +225,14 @@ func (p *Processor) commitEndOfScenario() error {
 		Value: b,
 	}
 
-	if err := cl.ProduceSync(ctx, record).FirstErr(); err != nil {
+	if err := cl.ProduceSync(context.Background(), record).FirstErr(); err != nil {
 		return fmt.Errorf("commitEndOfScenario ERR: producer sending message ERR: %v", err)
 	}
 
 	return nil
 }
 
-func (p *Processor) commitStartOfScenario() error {
+func (p *Processor) deleteScenario() error {
 	seeds := []string{
 		"kafka_orchestrator_and_runner1:9092",
 		"kafka_orchestrator_and_runner2:9092",
@@ -230,41 +241,96 @@ func (p *Processor) commitStartOfScenario() error {
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
-		kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
-		return fmt.Errorf("commitStartOfScenario ERR: client creating ERR: %v", err)
+		return fmt.Errorf("deleteScenario ERR: client creating ERR: %v", err)
 	}
 	defer cl.Close()
-
-	ctx := context.Background()
 
 	b, err := json.Marshal(p.Path)
 
 	if err != nil {
-		return fmt.Errorf("commitStartOfScenario ERR: marshaling ERR: %v", err)
+		return fmt.Errorf("deleteScenario ERR: marshaling ERR: %v", err)
 	}
 
 	record := &kgo.Record{
-		Topic: "start",
+		Topic: "delete",
 		Value: b,
 	}
 
-	if err := cl.ProduceSync(ctx, record).FirstErr(); err != nil {
-		return fmt.Errorf("commitStartOfScenario ERR: producer sending message ERR: %v", err)
+	if err := cl.ProduceSync(context.Background(), record).FirstErr(); err != nil {
+		return fmt.Errorf("deleteScenario ERR: producer sending message ERR: %v", err)
 	}
 
 	return nil
+}
+
+func (p *Processor) commitStartOfScenario() error {
+	baseURL := "http://orchestrator:9000/start"
+
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("commitStartOfScenario ERR: parsing baseURL ERR: %v", err)
+	}
+
+	q := u.Query()
+	q.Set("path", p.Path)
+	q.Set("epoch", fmt.Sprintf("%d", p.Epoch))
+	u.RawQuery = q.Encode()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	resp, err := client.Post(u.String(), "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("commitStartOfScenario ERR: sending request ERR: %v", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return ErrVideoNotFound
+	case http.StatusConflict:
+		return ErrEpochNotEqual
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("commitStartOfScenario ERR: unexpected status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	metaURL := fmt.Sprintf("http://orchestrator:9000/meta?path=%s", url.QueryEscape(p.Path))
+
+	for i := 0; i < 5; i++ {
+		time.Sleep(200 * time.Millisecond)
+
+		resp, err := client.Get(metaURL)
+		if err != nil {
+			continue
+		}
+
+		var meta struct {
+			Status     string `json:"status"`
+			StartFrame int64  `json:"start_frame"`
+			Epoch      int64  `json:"epoch"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&meta); err == nil {
+			resp.Body.Close()
+			if meta.Status == "Running" {
+				return nil
+			}
+		}
+		resp.Body.Close()
+	}
+
+	return fmt.Errorf("commitStartOfScenario ERR: status not updated to Running after start")
 }
 
 func (p *Processor) processScenario() error {
 	video, err := vidio.NewVideo(p.Path)
 
 	if err != nil {
-		return fmt.Errorf("processScenario ERR: receiving path ERR: %v", err)
+		return fmt.Errorf("readPath ERR: receiving path ERR: %v", err)
 	}
-
 	defer video.Close()
 
 	seeds := []string{"kafka_runner_to_inference1:9092"}
@@ -275,7 +341,6 @@ func (p *Processor) processScenario() error {
 		kgo.RequiredAcks(kgo.NoAck()),
 		kgo.ProducerBatchMaxBytes(100_000_000),
 		kgo.MaxBufferedRecords(10),
-		//kgo.AllowAutoTopicCreation(),
 	)
 
 	if err != nil {
@@ -292,7 +357,7 @@ func (p *Processor) processScenario() error {
 			break
 		}
 
-		if id <= p.StartFrame {
+		if id <= p.StartFrame || id%25 != 0 {
 			id++
 
 			continue
@@ -302,6 +367,7 @@ func (p *Processor) processScenario() error {
 			Frame: video.FrameBuffer(),
 			Path:  p.Path,
 			ID:    id,
+			Epoch: p.Epoch,
 		})
 
 		if err != nil {
@@ -321,6 +387,7 @@ func (p *Processor) processScenario() error {
 	}
 
 	if !p.stopped {
+		fmt.Printf("ended scenario %v\n", p.Path)
 		err = p.commitEndOfScenario()
 
 		p.stopped = true

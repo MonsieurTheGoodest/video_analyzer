@@ -9,16 +9,22 @@ RUN update-ca-certificates
 
 WORKDIR /orchestrator
 
+RUN go mod init orchestrator
+RUN go get github.com/twmb/franz-go
+RUN go get github.com/jackc/pgx/v5/pgxpool
+RUN go get github.com/go-chi/chi/v5
+
 COPY ./cmd/ ./cmd/
 COPY ./db/ ./db/
 COPY ./orchestrator/ ./orchestrator/
 COPY ./worker/ ./worker/
 COPY ./statuses/ ./statuses/
 COPY ./initdb/ ./initdb/
+COPY ./health_check/ ./health_check/
+COPY ./server/ ./server/
+COPY ./service/ ./service/
+COPY ./route/ ./route/
 
-RUN go mod init orchestrator
-RUN go get github.com/twmb/franz-go
-RUN go get github.com/jackc/pgx/v5/pgxpool
 RUN go mod tidy
 
 ENTRYPOINT ["go", "run", "cmd/main.go"]

@@ -9,11 +9,12 @@ RUN update-ca-certificates
 
 WORKDIR /inference
 
+RUN go mod init inference
+RUN go get github.com/twmb/franz-go
+
 COPY ./cmd/ ./cmd/
 COPY ./inference/ ./inference/
 
-RUN go mod init inference
-RUN go get github.com/twmb/franz-go
 RUN go mod tidy
 
 ENTRYPOINT ["go", "run", "cmd/main.go"]

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -13,32 +15,108 @@ type image struct {
 	Frame []byte `json:"frame"`
 	Path  string `json:"path"`
 	ID    int64  `json:"id"`
+	Epoch int64  `json:"epoch"`
 }
 
 type object struct {
 	ID     int64  `json:"id"`
 	Path   string `json:"path"`
 	Object string `json:"object"`
+	Epoch  int64  `json:"epoch"`
 }
 
 type Processor struct {
-	images  chan image
-	objects chan object
+	images           chan image
+	objects          chan object
+	mu               *sync.Mutex
+	currentProcesses map[string]int64
+	lastPathUsing    map[string]time.Time
+}
+
+type stopping struct {
+	StopPath string `json:"stop_path"`
+	Epoch    int64  `json:"epoch"`
 }
 
 const imagesSize = 50
 const objectsSize = 50
+const maxUnusedTime = time.Minute * 2
 
 func NewProcessor() *Processor {
 	return &Processor{
-		images:  make(chan image, imagesSize),
-		objects: make(chan object, objectsSize),
+		images:           make(chan image, imagesSize),
+		objects:          make(chan object, objectsSize),
+		mu:               &sync.Mutex{},
+		currentProcesses: make(map[string]int64),
+		lastPathUsing:    map[string]time.Time{},
 	}
 }
 
-func (p *Processor) close() {
-	close(p.images)
-	close(p.objects)
+func (p *Processor) Clear() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	del := make([]string, 0)
+
+	for path, lastUsing := range p.lastPathUsing {
+		if lastUsing.Add(maxUnusedTime).Before(time.Now()) {
+			del = append(del, path)
+		}
+	}
+
+	for _, path := range del {
+		delete(p.currentProcesses, path)
+		delete(p.lastPathUsing, path)
+	}
+}
+
+func (p *Processor) CheckStopping() error {
+	defer p.close()
+
+	seeds := []string{"kafka_runner_to_inference1:9092"}
+
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(seeds...),
+		kgo.ConsumerGroup("checkStopping"),
+		kgo.ConsumeTopics("stop"),
+		kgo.AllowAutoTopicCreation(),
+		kgo.DisableAutoCommit(),
+	)
+
+	if err != nil {
+		return fmt.Errorf("checkStopping ERR: client creating ERR: %v", err)
+	}
+	defer cl.Close()
+
+	for {
+		fetches := cl.PollFetches(context.Background())
+
+		if errs := fetches.Errors(); len(errs) > 0 {
+			return fmt.Errorf("checkStopping ERR: fetching message ERR: %v", errs)
+		}
+
+		iter := fetches.RecordIter()
+
+		for {
+			record := iter.Next()
+
+			if record == nil || len(record.Value) == 0 {
+				return fmt.Errorf("checkStopping ERR: refusing to send empty value")
+			}
+
+			var stp stopping
+
+			err = json.Unmarshal(record.Value, &stp)
+
+			if err != nil {
+				return fmt.Errorf("checkStopping ERR: Unmarshaling ERR: %v", err)
+			}
+
+			if _, ok := p.currentProcesses[stp.StopPath]; ok {
+				p.currentProcesses[stp.StopPath] = stp.Epoch + 1
+			}
+		}
+	}
 }
 
 func (p *Processor) ReadFrame() error {
@@ -50,7 +128,6 @@ func (p *Processor) ReadFrame() error {
 		kgo.SeedBrokers(seeds...),
 		kgo.ConsumerGroup("inference"),
 		kgo.ConsumeTopics("frames"),
-		//kgo.AllowAutoTopicCreation(),
 		kgo.DisableAutoCommit(),
 		kgo.FetchMaxBytes(100_000_000),
 	)
@@ -88,6 +165,10 @@ func (p *Processor) ReadFrame() error {
 				return fmt.Errorf("readFrame ERR: record Unmarshaling ERR: %v", err)
 			}
 
+			if !p.checkEpoch(img) {
+				continue
+			}
+
 			p.images <- img
 		}
 	}
@@ -97,10 +178,15 @@ func (p *Processor) ProcessFrame() error {
 	defer p.close()
 
 	for img := range p.images {
+		if !p.checkEpoch(img) {
+			continue
+		}
+
 		p.objects <- object{
 			Path:   img.Path,
 			Object: strconv.Itoa(int(img.ID)),
 			ID:     img.ID,
+			Epoch:  img.Epoch,
 		}
 	}
 
@@ -110,7 +196,7 @@ func (p *Processor) ProcessFrame() error {
 func (p *Processor) SendObjects() error {
 	defer p.close()
 
-	seeds := []string{"kafka_inference_to_orchestrator1:9092"}
+	seeds := []string{"kafka_inference_and_orchestrator1:9092"}
 
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
@@ -131,6 +217,7 @@ func (p *Processor) SendObjects() error {
 			Object: obj.Object,
 			Path:   obj.Path,
 			ID:     obj.ID,
+			Epoch:  obj.Epoch,
 		})
 
 		if err != nil {
@@ -149,4 +236,21 @@ func (p *Processor) SendObjects() error {
 	}
 
 	return nil
+}
+
+func (p *Processor) close() {
+	close(p.images)
+	close(p.objects)
+}
+
+func (p *Processor) checkEpoch(img image) bool {
+	p.lastPathUsing[img.Path] = time.Now()
+
+	if epoch, ok := p.currentProcesses[img.Path]; ok {
+		return img.Epoch >= epoch
+	}
+
+	p.currentProcesses[img.Path] = img.Epoch
+
+	return true
 }
