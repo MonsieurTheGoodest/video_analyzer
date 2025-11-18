@@ -10,5 +10,3 @@ docker build -t api:v01 ./api
 docker build -t orchestrator:v01 ./orchestrator
 docker build -t runner:v01 ./runner
 docker build -t inference:v01 ./inference
-
-

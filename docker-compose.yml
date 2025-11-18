@@ -169,24 +169,6 @@ services:
         ports:
             - 49091:29092
 
-    # init_orchestrator_and_runner:
-    #     image: apache/kafka:4.0.1
-    #     restart: "no"
-    #     networks: [internet]
-    #     depends_on:
-    #         kafka_orchestrator_and_runner1:
-    #             condition: service_healthy
-    #         kafka_orchestrator_and_runner2:
-    #             condition: service_healthy
-    #         kafka_orchestrator_and_runner3:
-    #             condition: service_healthy
-    #     entrypoint:
-    #         - /bin/sh
-    #         - -exc
-    #         - opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_orchestrator_and_runner1:9092 --create --if-not-exists --topic path \
-    #             --config cleanup.policy=compact,delete \
-    #             && /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka_orchestrator_and_runner3:9092 --list
-
     init_runner_to_inference:
         image: apache/kafka:4.0.1
         restart: "no"
