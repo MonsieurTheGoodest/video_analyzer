@@ -71,8 +71,6 @@ func (p *Processor) Clear() {
 }
 
 func (p *Processor) CheckStopping() error {
-	defer p.close()
-
 	seeds := []string{"kafka_runner_to_inference1:9092"}
 
 	cl, err := kgo.NewClient(
@@ -120,8 +118,6 @@ func (p *Processor) CheckStopping() error {
 }
 
 func (p *Processor) ReadFrame() error {
-	defer p.close()
-
 	seeds := []string{"kafka_runner_to_inference1:9092"}
 
 	cl, err := kgo.NewClient(
@@ -175,8 +171,6 @@ func (p *Processor) ReadFrame() error {
 }
 
 func (p *Processor) ProcessFrame() error {
-	defer p.close()
-
 	for img := range p.images {
 		if !p.checkEpoch(img) {
 			continue
@@ -194,8 +188,6 @@ func (p *Processor) ProcessFrame() error {
 }
 
 func (p *Processor) SendObjects() error {
-	defer p.close()
-
 	seeds := []string{"kafka_inference_and_orchestrator1:9092"}
 
 	cl, err := kgo.NewClient(
@@ -238,7 +230,7 @@ func (p *Processor) SendObjects() error {
 	return nil
 }
 
-func (p *Processor) close() {
+func (p *Processor) Close() {
 	close(p.images)
 	close(p.objects)
 }

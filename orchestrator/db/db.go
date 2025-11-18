@@ -15,7 +15,7 @@ type DataBase struct {
 	Pool *pgxpool.Pool
 }
 
-const defaultURL = "postgres://postgres:ergotechnolain@postgres:5432/postgres?sslmode=disable"
+const defaultURL = "postgres://postgres:pass@postgres:5432/postgres?sslmode=disable"
 const initSQLPath = "./initdb/001_schema.sql"
 
 var ErrVideoNotFound error = errors.New("video not found")

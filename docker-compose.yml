@@ -250,7 +250,7 @@ services:
             retries: 5
             start_period: 10s
         environment:
-            - POSTGRES_PASSWORD=ergotechnolain
+            - POSTGRES_PASSWORD=pass
         ports:
             - 65432:5432
         networks:

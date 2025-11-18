@@ -16,12 +16,14 @@ type processor interface {
 	SendObjects() error
 	CheckStopping() error
 	Clear()
+	Close()
 }
 
 const clearTime = time.Minute * 10
 
 func main() {
 	var p processor = inference.NewProcessor()
+	defer p.Close()
 
 	errCh := make(chan error, 4)
 	defer close(errCh)
