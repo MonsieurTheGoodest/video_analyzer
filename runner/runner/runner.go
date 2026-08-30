@@ -354,6 +354,24 @@ func (p *Processor) processScenario() error {
 
 	for video.Read() {
 		if p.stopped {
+			stop, err := json.Marshal(stopping{
+				StopPath: p.Path,
+				Epoch:    p.Epoch,
+			})
+
+			if err != nil {
+				return fmt.Errorf("processScenario ERR: record Marshaling ERR: %v", err)
+			}
+
+			record := &kgo.Record{
+				Topic: "stop",
+				Value: stop,
+			}
+
+			if err := cl.ProduceSync(ctx, record).FirstErr(); err != nil {
+				return fmt.Errorf("processScenario ERR: producer sending message ERR: %v", err)
+			}
+			
 			break
 		}
 
