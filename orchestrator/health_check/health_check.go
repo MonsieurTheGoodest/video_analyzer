@@ -38,9 +38,27 @@ func HealthCheck(database *db.DataBase) error {
 				}
 				outdatedPaths = append(outdatedPaths, path)
 			}
-			rows.Close()
 
 			if len(outdatedPaths) > 0 {
+				all_rows, err := database.Pool.Query(ctx, `
+					SELECT path 
+					FROM current_processes
+				`)
+				if err != nil {
+					log.Printf("healthCheck ERR: selecting outdated processes ERR: %v", err)
+					continue
+				}
+				defer all_rows.Close()
+
+				outdatedPaths = []string{}
+				for all_rows.Next() {
+					var path string
+					if err := all_rows.Scan(&path); err != nil {
+						return fmt.Errorf("healthCheck ERR: scanning path ERR: %v", err)
+					}
+					outdatedPaths = append(outdatedPaths, path)
+				}
+
 				log.Printf("healthCheck: %d outdated process(es), resetting...", len(outdatedPaths))
 				for _, path := range outdatedPaths {
 					if err := database.Reset(ctx, path); err != nil {
